@@ -1,0 +1,24 @@
+# configuração gerada no build (contém URL e chave do Supabase)
+public/config.js
+
+# variáveis de ambiente locais
+.env
+.env.*
+!.env.example
+
+# dados do negócio nunca vão para o repositório (planilhas, backups exportados do app)
+*.xlsx
+*.xls
+*.csv
+maturidade-asi-*.json
+backup*.json
+
+# Supabase CLI / Vercel / Node
+supabase/.temp/
+supabase/.branches/
+.vercel/
+node_modules/
+
+# sistema
+.DS_Store
+Thumbs.db

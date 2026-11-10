@@ -1,0 +1,11 @@
+{
+  "name": "maturidade-asi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Níveis de Maturidade Organizacional das squads da ASI (HTML/CSS/JS + Supabase).",
+  "scripts": {
+    "build": "node scripts/build-config.js",
+    "dev": "node scripts/build-config.js && node scripts/serve.js"
+  },
+  "engines": { "node": ">=18" }
+}
