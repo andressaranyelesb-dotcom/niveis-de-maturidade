@@ -412,3 +412,52 @@ h3.sec { margin: 22px 0 10px; }
 .acctst { font-size: 11px; color: #2E7D32; } .acctst.saving { color: #B35F00; } .acctst.err { color: #B00020; } .acctst.off { color: #666; }
 .acctbtn { display: flex; flex-wrap: wrap; gap: 6px; } .acctbtn .btn { padding: 4px 8px; font-size: 11px; }
 table.mig { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; } table.mig th, table.mig td { padding: 5px 8px; border-bottom: 1px solid #E0E0E0; text-align: left; } table.mig .num, table.mig th:not(:first-child) { text-align: right; }
+
+/* seta de expansão das linhas de Célula de Produto e squad: aponta para a direita (recolhido) e para baixo (expandido) */
+.xchev { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 4px; color: #A6193C; transition: transform .15s ease; }
+.xchev svg { display: block; }
+tr.tgrp[aria-expanded="true"] > td .xchev { transform: rotate(90deg); }
+tr.tgrp:hover .xchev { background: rgba(166,25,60,.08); }
+.tcard { align-items: center; gap: 10px; }
+tr.sqh .sqc { align-items: center; }
+tr.sqh .sqc .vb { margin-top: 0; align-self: stretch; height: auto; min-height: 30px; }
+@media (prefers-reduced-motion: reduce) { .xchev { transition: none; } }
+
+/* alerta de pendências da ficha da squad */
+.pendalert { display: flex; align-items: center; gap: 14px; margin: 0 0 14px; padding: 10px 12px 10px 16px; border-left: 5px solid #F68B1F; border-radius: 8px; background: linear-gradient(90deg, #FDE9D3 0%, #FEF3E7 55%, #FFF8F0 100%); box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+.pendic { flex: none; display: inline-flex; color: #F68B1F; }
+.pendtx { flex: 1; min-width: 0; font-size: 16px; color: #3B2414; }
+.pendbtn { flex: none; border: 0; border-radius: 999px; padding: 9px 18px; background: #8E1534; color: #fff; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.18); transition: background .15s; }
+.pendbtn:hover { background: #A6193C; }
+.pendbtn:focus-visible { outline: 2px solid #F68B1F; outline-offset: 2px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+@media (max-width: 560px) { .pendalert { flex-wrap: wrap; gap: 10px; } .pendtx { font-size: 15px; } .pendbtn { width: 100%; } }
+/* ficha da squad: pendências → Necessidades → Nível de maturidade atual */
+.sqsec { padding: 12px 0; border-top: 1px solid #EEF0F2; }
+.pendalert + .sqsec { border-top: 0; padding-top: 2px; }
+.sqsh { font-size: 14px; font-weight: 700; color: #333333; margin: 0 0 8px; }
+.necrow { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+.necpct { flex: none; display: grid; line-height: 1.05; min-width: 70px; }
+.necpct b { font-size: 24px; font-weight: 700; color: #2F9E5F; }
+.necpct span { font-size: 11px; color: #666666; }
+.necbar { flex: 1; min-width: 0; display: grid; gap: 5px; }
+.necbar .bar { height: 10px; }
+.necsum { color: #4B5563; }
+.kvgrid { grid-template-columns: max-content minmax(0, 1fr) max-content minmax(0, 1fr); gap: 4px 14px; align-items: baseline; }
+.kvgrid dd { min-width: 0; overflow-wrap: anywhere; }
+.sqsec .lvbox { background: #F1F3F5; border-radius: 8px; padding: 8px 12px; }
+@media (max-width: 640px) { .kvgrid { grid-template-columns: max-content minmax(0, 1fr); } .necpct b { font-size: 20px; } .sqsec .lvcur .btn { width: 100%; } }
+
+/* Necessidades: barra contínua em largura total + resumo em uma linha */
+.necbox { display: grid; gap: 8px; margin-bottom: 12px; }
+.necbarra { height: 12px; border-radius: 999px; background: #E9ECF0; }
+.necbarra i:first-child { border-radius: 999px 0 0 999px; } .necbarra i:last-child { border-radius: 0 999px 999px 0; } .necbarra i:only-child { border-radius: 999px; }
+.necbox .necsum { font-size: 13px; color: #374151; line-height: 1.4; }
+.necbox .necsum b { font-size: 14px; font-weight: 700; color: #1F2937; margin-right: 2px; }
+/* estágios: ícone do card e régua dos cards das squads com os novos nomes */
+.lv .lvic { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; border-radius: 9px; margin-bottom: 8px; color: var(--c); background: color-mix(in srgb, var(--c) 11%, #fff); }
+.lv .lvic svg { display: block; }
+.track, .track-l { column-gap: 5px; }
+.track-l { font-size: 10px; line-height: 1.2; letter-spacing: -.1px; }
+.track-l span { overflow-wrap: normal; word-break: normal; hyphens: auto; -webkit-hyphens: auto; text-wrap: balance; }
+@media (max-width: 760px) { .lv .lvic { width: 28px; height: 28px; margin-bottom: 6px; } .lv .lvic svg { width: 18px; height: 18px; } }

@@ -46,6 +46,7 @@ function mergeSeed() {
   // necessidade cuja squad não existe mais continua visível (em "A Classificar") em vez de ficar oculta
   for (const n of DB.needs) if (!G(DB.squads, n.squadId) && n.squadId !== UNC) { n.historico = n.historico || []; n.historico.push({ data: new Date().toISOString().slice(0, 10), tipo: 'edicao', nota: 'Squad não localizada no cadastro; necessidade mantida em A Classificar.' }); n.squadId = UNC; add = true; }
   if (normalizarNecessidades()) add = true;
+  if (syncPlanilha()) add = true;
   return merged || add;
 }
 // Regras de importação: "x" na planilha = necessidade concluída; um mesmo item (ID do Azure ou célula de origem) nunca é cadastrado duas vezes.
@@ -88,17 +89,50 @@ function mergeSame(from, to) {
   DB.squads = DB.squads.filter(x => x.id !== from);
   return true;
 }
+// Regra única de sincronização planilha → avaliação.
+// Cada marcação "x" (DB.marcacoes: squadId + criterioId) é aplicada UMA vez na avaliação da squad como "Sim" (aplicadaEm).
+// Depois disso a avaliação persistida é a única fonte das telas (resumo, detalhamento e formulário) e do cálculo do nível;
+// uma mudança feita depois no formulário não é desfeita. Uma nova importação da planilha reaplica os "x" dela.
+// Critérios sem "x" não são tocados (continuam com a resposta que tinham ou "Não avaliado").
+function syncPlanilha(only, fonte) {
+  let ch = false; const by = new Map();
+  for (const m of DB.marcacoes || []) {
+    if (m.aplicadaEm || (only && !only.includes(m.squadId)) || !G(DB.squads, m.squadId) || !G(DB.criterios, m.criterioId)) continue;
+    if (!by.has(m.squadId)) by.set(m.squadId, []); by.get(m.squadId).push(m);
+  }
+  for (const [sid, ms] of by) {
+    const s = G(DB.squads, sid); let av = avalOf(sid);
+    const muda = ms.filter(m => !av || (av.respostas || {})[m.criterioId] !== 'sim');
+    ms.forEach(m => { m.aplicadaEm = TODAY; }); ch = true;
+    if (!muda.length) continue;
+    if (!av) { av = { id: 'av-' + sid, squadId: sid, data: TODAY, obs: '', respostas: {} }; DB.avaliacoes.push(av); }
+    av.respostas = av.respostas || {};
+    const eraNao = muda.filter(m => av.respostas[m.criterioId] === 'nao').length;
+    muda.forEach(m => { av.respostas[m.criterioId] = 'sim'; });
+    av.origem = [...new Set([...(av.origem || []), 'planilha'])];
+    av.planilha = { data: TODAY, arquivo: fonte || (av.planilha && av.planilha.arquivo) || 'planilha de maturidade', marcados: DB.marcacoes.filter(m => m.squadId === sid).length };
+    av.salvaEm = TODAY; if (!av.data) av.data = TODAY;
+    const res = classify(av.respostas); av.nivelResultado = res.nivel;
+    if ((s.nivel || null) !== res.nivel) {
+      const ult = DB.nivelHist.filter(h => h.squadId === sid).map(h => h.data).sort().pop(), d = ult && ult > TODAY ? ult : TODAY;
+      setNivel(s, res.nivel, d, 'Sincronizado com a planilha de maturidade: ' + muda.length + ' critério(s) com "x"' + (eraNao ? ' (' + eraNao + ' antes como "Não")' : '') + '.', { avaliacaoId: av.id, id: (k => G(DB.nivelHist, k) ? uid('nh') : k)('nh-pl-' + sid + '-' + res.nivel + '-' + d) });   // id fixo evita duplicar se dois navegadores sincronizarem juntos
+    }
+  }
+  return ch;
+}
 function load() {
   try { const r = localStorage.getItem(KEY); if (r) { DB = JSON.parse(r); if (mergeSeed()) save(); return; } } catch (e) { }
-  DB = clone(window.SEED); normalizarNecessidades(); save();
+  DB = clone(window.SEED); normalizarNecessidades(); syncPlanilha(); save();
 }
 function save() { try { localStorage.setItem(typeof SYNC !== 'undefined' && SYNC.on ? KEY + '-cloud' : KEY, JSON.stringify(DB)); } catch (e) { } if (typeof SYNC !== 'undefined' && SYNC.on) syncSoon(); }
 
 // ---------------- consultas de domínio ----------------
 const niv = id => id ? G(DB.niveis, id) : null;
 const nivRank = id => { const n = niv(id); return n ? n.ordem : 0; };
-const nivLabel = id => { const n = niv(id); return n ? (n.fase === 'Consolidação' ? n.rotulo + ' · consolidação' : n.rotulo) : 'Não avaliado'; };
-const nivShort = id => { const n = niv(id); return n ? n.rotulo : 'Não avaliado'; };
+// Nomenclatura oficial dos estágios exibida em toda a interface (o id e as regras de cada estágio não mudam).
+const NIV_NOME = { N0: 'Inconsciente', T01: 'Transição 0 → 1', N1: 'Focado em Times', T12: 'Transição 1 → 2', N2: 'Orientado ao Cliente' };
+const nivLabel = id => { const n = niv(id); return n ? NIV_NOME[n.id] || n.rotulo : 'Não avaliado'; };
+const nivShort = nivLabel;
 const nivCol = id => LV_COL[id || 'nd'];
 // Regra única de classificação (formulário, detalhes da squad, Níveis de Maturidade e Visão Geral usam o resultado salvo por ela).
 // respostas: { criterioId: 'sim' | 'nao' }; critério sem resposta = não avaliado (nunca conta como atendido).
@@ -316,6 +350,7 @@ function setNivel(s, para, data, nota, extra) {
 
 // ---------------- estado de UI ----------------
 let ui = { open: {}, view: 'geral', nv: 'tabela', sort: { k: 'squad', d: 1 }, q: '', cad: 'squads', per: null, cmp: [] };
+let _tw = {}; const twice = (k, msg) => { if (_tw[k]) { _tw[k] = 0; return true; } _tw[k] = 1; toast(msg); setTimeout(() => { _tw[k] = 0; }, 4000); return false; };
 const toast = m => { const t = document.createElement('div'); t.textContent = m; t.style.cssText = 'position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:#1F3A5F;color:#fff;padding:10px 18px;border-radius:6px;z-index:99;font-size:13px'; document.body.appendChild(t); setTimeout(() => t.remove(), 3200); };
 
 // ---------------- Visão Geral ----------------
@@ -331,8 +366,7 @@ function evoCmp(squads, haHist) {
   const legend = `<div class="evoleg"><span><i style="background:${cA}"></i>${esc(A.p.label)}</span><span><i style="background:${cB}"></i>${esc(B.p.label)}</span></div>`;
   const nec = [['Concluídas no período', 'concl'], ['Concluídas (acum.)', 'done'], ['Em andamento', 'and'], ['Pendentes', 'pend']];
   return {
-    ctl: `<div class="toolbar"><b>Comparar períodos</b> ${sel('a')} <b>com</b> ${sel('b')} <span class="evoq">${quick}</span></div>
-  <div class="note">O período escolhido vale para os dois gráficos de evolução semestral (squads e necessidades). Cada período usa o <b>histórico registrado</b> (nível e status em cada data), sem reconstruir o passado a partir do estado atual. Necessidades importadas só passam a existir no histórico a partir de ${fmt(TODAY)}; períodos anteriores aparecem como "sem registro".</div>`,
+    ctl: `<div class="toolbar"><b>Comparar períodos</b> ${sel('a')} <b>com</b> ${sel('b')} <span class="evoq">${quick}</span></div>`,
     sq: `<div class="panel"><h3>Evolução semestral das squads por nível de maturidade</h3><div class="hint">Ao fim de cada período (${squads.length} squad(s) no filtro).</div>
   ${haHist ? colChart(cats.map(catL), [{ name: A.p.label, color: cA, values: cats.map(c => A.dist[c] || 0) }, { name: B.p.label, color: cB, values: cats.map(c => B.dist[c] || 0) }], 260) + legend : '<div class="empty">Nenhum nível registrado ainda. Avalie as squads em <b>Níveis de Maturidade</b> (detalhes da squad › <b>Avaliar maturidade</b>); a data da avaliação pode ser retroativa para semestres passados.</div>'}</div>`,
     nec: `<div class="panel"><h3>Evolução semestral das necessidades</h3><div class="hint">Posição ao fim de cada período.</div>
@@ -410,9 +444,9 @@ function vNeeds() {
     const ss = [...sqs.filter(s => cpKey(s) === cp)].sort((x, y) => ((G(DB.times, x.timeId) || {}).codigo || '').localeCompare((G(DB.times, y.timeId) || {}).codigo || '') || x.codigo.localeCompare(y.codigo)); if (!ss.length) return '';
     const nn = sum(ss.map(s => (bySq.get(s.id) || []).length)), key = 'cp:' + cp;
     const isOpen = ui.open[key] !== undefined ? ui.open[key] : autoOpen;
-    const head = `<tr class="tgrp" tabindex="0" role="button" aria-expanded="${isOpen}" data-act="toggleTime" data-id="${key}" data-open="${isOpen ? 1 : 0}"><td colspan="3"><div class="tcard"><span class="chev" aria-hidden="true">${isOpen ? '▾' : '▸'}</span><span class="timechip cpchip">${cp === 'Sem CP' || cp === 'A Classificar' ? '—' : 'Célula<br>' + esc(cp.replace('CP ', ''))}</span><div class="tinfo"><b>${cp === 'A Classificar' ? 'A Classificar (squad não identificada)' : cp === 'Sem CP' ? 'Célula de Produto não informada' : esc(cpLabel(cp))}</b><span class="muted small">${ss.length} squad(s) · ${nn} necessidade(s)</span></div></div></td></tr>`;
+    const head = `<tr class="tgrp" tabindex="0" role="button" aria-expanded="${isOpen}" data-act="toggleTime" data-id="${key}" data-open="${isOpen ? 1 : 0}"><td colspan="3"><div class="tcard"><span class="xchev" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><div class="tinfo"><b>${cp === 'A Classificar' ? 'A Classificar (squad não identificada)' : cp === 'Sem CP' ? 'Célula de Produto não informada' : esc(cpLabel(cp))}</b><span class="muted small">${ss.length} squad(s) · ${nn} necessidade(s)</span></div></div></td></tr>`;
     return head + (!isOpen ? '' : ss.map(s => { const ns = bySq.get(s.id) || [], tm = G(DB.times, s.timeId) || {}, sk = 'sq:' + s.id, so = ui.open[sk] === true;
-      const row = `<tr class="tgrp sqh" tabindex="0" role="button" aria-expanded="${so}" data-act="toggleTime" data-id="${sk}" data-open="${so ? 1 : 0}"><td><div class="sqc"><span class="chev" aria-hidden="true">${so ? '▾' : '▸'}</span><span class="vb" aria-hidden="true"></span><div><b>${esc(sqName(s))}</b> ${s.virtual ? '' : `<span class="chip" title="Time">Time ${esc(tm.codigo || '—')}</span>`}<div class="sub">${esc(s.sistema || 'Sistema não informado')}</div>${DB.squads.filter(x => x.codigo === s.codigo && x.id !== s.id).map(x => `<div class="small late">⚠ Código também usado no Time ${esc((G(DB.times, x.timeId) || {}).codigo || '?')}: confirmar se é a mesma squad</div>`).join('')}</div></div></td>
+      const row = `<tr class="tgrp sqh" tabindex="0" role="button" aria-expanded="${so}" data-act="toggleTime" data-id="${sk}" data-open="${so ? 1 : 0}"><td><div class="sqc"><span class="xchev" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="vb" aria-hidden="true"></span><div><b>${esc(sqName(s))}</b> ${s.virtual ? '' : `<span class="chip" title="Time">Time ${esc(tm.codigo || '—')}</span>`}<div class="sub">${esc(s.sistema || 'Sistema não informado')}</div>${DB.squads.filter(x => x.codigo === s.codigo && x.id !== s.id).map(x => `<div class="small late">⚠ Código também usado no Time ${esc((G(DB.times, x.timeId) || {}).codigo || '?')}: confirmar se é a mesma squad</div>`).join('')}</div></div></td>
       <td class="nsum">${ns.length ? '<b>' + ns.length + '</b> necessidade(s)' + (ns.some(n => n.status === 'Concluída') ? '<div class="muted small">' + ns.filter(n => n.status === 'Concluída').length + ' concluída(s)</div>' : '') : '<span class="muted small">Sem necessidades registradas</span>'}</td>
       <td>${lead('co', 'COACH', pName('coaches', s.coachId))}</td></tr>`;
       if (!so) return row;
@@ -515,25 +549,42 @@ function askStatus(id, para) {
 }
 
 // ---------------- Maturidade ----------------
+// Ícones dos estágios (outline, cor herdada do card): olho fechado, foguete, equipe, engrenagem com seta, alvo.
+const IC_SVG = p => '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + p + '</svg>';
+const IC_LV = {
+  N0: IC_SVG('<path d="M3 10c2.3 3 5.4 4.5 9 4.5s6.7-1.5 9-4.5"/><path d="M5.6 13.1 4 15.4M9.4 14.3 8.8 17M14.6 14.3l.6 2.7M18.4 13.1l1.6 2.3"/>'),
+  T01: IC_SVG('<path d="M12 2.8c3 2 4.6 5.3 4.6 9.2v4.4H7.4V12c0-3.9 1.6-7.2 4.6-9.2z"/><circle cx="12" cy="9.6" r="1.7"/><path d="M7.4 12.6 4.6 15.4v2.4l2.8-1.4M16.6 12.6l2.8 2.8v2.4l-2.8-1.4"/><path d="M10.2 19.2 12 21.4l1.8-2.2"/>'),
+  N1: IC_SVG('<circle cx="12" cy="8" r="3"/><path d="M6.5 19.5v-1a5.5 5.5 0 0111 0v1"/><circle cx="5" cy="9.5" r="2.2"/><path d="M1.8 18.5v-.6a3.7 3.7 0 014.6-3.6"/><circle cx="19" cy="9.5" r="2.2"/><path d="M22.2 18.5v-.6a3.7 3.7 0 00-4.6-3.6"/>'),
+  T12: IC_SVG('<circle cx="10" cy="13" r="2.6"/><path d="M10 6.2v1.6M10 18.2v1.6M3.2 13h1.6M15.2 13h1.6M5.2 8.2l1.1 1.1M13.7 16.7l1.1 1.1M5.2 17.8l1.1-1.1M13.7 9.3l1.1-1.1"/><circle cx="10" cy="13" r="5"/><path d="M15.5 3.5h5v5M20.5 3.5l-5.2 5.2"/>'),
+  N2: IC_SVG('<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/>'),
+};
 function vMat() {
   const { squads, needs } = getFiltered();
   const semAv = squads.filter(s => !s.nivel).length;
   const LVC = { N0: ['#4B5563', '#374151'], T01: ['#2563EB', '#1D4ED8'], N1: ['#059669', '#047857'], T12: ['#F68B1F', '#B45309'], N2: ['#A6193C', '#A6193C'] };
   const legend = `<div class="panel" style="margin-bottom:14px"><h3>Níveis de Maturidade</h3><div class="hint">Visualize os níveis de maturidade organizacional, suas características e a distribuição das squads em cada etapa.</div>
   ${semAv ? `<span class="badge b-n lvbadge" title="Squads ainda sem nível avaliado não entram em nenhuma etapa abaixo">${semAv} squad${semAv > 1 ? 's' : ''} sem avaliação</span>` : ''}
-  <ol class="lvgrid" aria-label="Níveis de Maturidade">${DB.niveis.map(l => { const nc = DB.criterios.filter(c => c.estagio === l.id).length, ns = squads.filter(s => s.nivel === l.id).length, [bar, tc] = LVC[l.id] || ['#999', '#333']; return `<li class="lv" tabindex="0" aria-describedby="tip-${l.id}" style="--c:${bar};--tc:${tc}"><span class="inf" aria-hidden="true">i</span><b>${esc(nivLabel(l.id))}</b><div class="cnt"><span>${nc} critério${nc === 1 ? '' : 's'}</span><span class="${ns ? 'has' : 'zero'}">${ns} squad(s)</span></div><span class="tip" role="tooltip" id="tip-${l.id}">${esc(l.descricao)}</span></li>`; }).join('')}</ol></div>`;
+  <ol class="lvgrid" aria-label="Níveis de Maturidade">${DB.niveis.map(l => { const nc = DB.criterios.filter(c => c.estagio === l.id).length, ns = squads.filter(s => s.nivel === l.id).length, [bar, tc] = LVC[l.id] || ['#999', '#333']; return `<li class="lv" tabindex="0" aria-describedby="tip-${l.id}" style="--c:${bar};--tc:${tc}"><span class="inf" aria-hidden="true">i</span><span class="lvic" aria-hidden="true">${IC_LV[l.id] || ''}</span><b>${esc(nivLabel(l.id))}</b><div class="cnt"><span>${nc} critério${nc === 1 ? '' : 's'}</span><span class="${ns ? 'has' : 'zero'}">${ns} squad(s)</span></div><span class="tip" role="tooltip" id="tip-${l.id}">${esc(l.descricao)}</span></li>`; }).join('')}</ol></div>`;
   if (!squads.length) return filterBar({ geral: true }) + legend + '<div class="empty">Nenhuma squad para os filtros atuais.</div>';
   return filterBar({ geral: true }) + legend + `<div class="grid sq-grid">${sortBy(squads, s => s.codigo + s.timeId).map(s => {
     const ns = needs.filter(n => n.squadId === s.id), x = stats(ns), lu = lastUpdate(s), rank = nivRank(s.nivel);
     return `<div class="card sqcard" data-act="openSq" tabindex="0" data-id="${s.id}" style="border-left-color:${nivCol(s.nivel)}">
     <div style="display:flex;justify-content:space-between;gap:8px"><div><h3>${esc(sqName(s))} <span class="muted small">· ${esc(timeName(s.timeId))}</span></h3><div class="small muted">${esc(s.sistema || 'Sistema/produto não informado')}</div></div>${s.cpClasse ? `<span class="chip">${esc(s.cpClasse)}</span>` : ''}</div>
-    <div><div class="track">${DB.niveis.map(l => `<span style="${l.ordem <= rank ? 'background:' + nivCol(l.id) : ''}"></span>`).join('')}</div><div class="track-l">${DB.niveis.map(l => `<span>${esc(l.rotulo.replace('Transição', 'Trans.'))}</span>`).join('')}</div><div style="margin-top:6px"><b>${esc(nivLabel(s.nivel))}</b></div></div>
+    <div><div class="track">${DB.niveis.map(l => `<span style="${l.ordem <= rank ? 'background:' + nivCol(l.id) : ''}"></span>`).join('')}</div><div class="track-l" lang="pt-BR">${DB.niveis.map(l => `<span>${esc(nivLabel(l.id))}</span>`).join('')}</div><div style="margin-top:6px"><b>${esc(nivLabel(s.nivel))}</b></div></div>
     <div><div class="bar">${[...STATUS].map(k => { const c = ns.filter(n => stOf(n) === k).length; return c ? `<i style="width:${c / (x.total || 1) * 100}%;background:${ST_COL[k]}" title="${esc(k)}: ${c}"></i>` : ''; }).join('')}</div>
     <div class="small" style="margin-top:4px">${x.total ? `Conclusão das necessidades: <b>${x.pct}%</b> (${x.concl} de ${x.total}) · ${x.pend} pendentes · ${x.and} em andamento` : '<span class="muted">Nenhuma necessidade registrada</span>'}</div></div>
     <dl class="kv">${s.ltId && pName('lts', s.ltId) ? `<dt>Líder técnico</dt><dd>${esc(pName('lts', s.ltId))}</dd>` : ''}<dt>Célula de Produto</dt><dd>${esc(cpLabel(s.cpClasse) || '—')}</dd><dt>Agile Coach</dt><dd>${esc(pName('coaches', s.coachId) || '—')}</dd><dt>Início acomp.</dt><dd>${fmt(s.inicio)}</dd><dt>Última atualização</dt><dd>${fmt(lu)}</dd></dl></div>`; }).join('')}</div>
   <div class="legend" style="margin-top:12px">${[...STATUS].map(k => `<span><i style="background:${ST_COL[k]}"></i>${esc(k)}</span>`).join('')}</div>`;
 }
 const IC_LAYERS = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg>', IC_SWAP = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M21 7H8"/><path d="M7 21l-4-4 4-4"/><path d="M3 17h13"/></svg>', IC_CLOCK = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 109-9 9 9 0 00-7 3.3L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>';
+const IC_PEND = '<svg viewBox="0 0 32 32" width="30" height="30" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="20" height="18" rx="3"/><path d="M3 12h20M8.5 3.5v5M17.5 3.5v5"/><circle cx="22.5" cy="22.5" r="6.5" fill="#FFF3E6"/><path d="M22.5 19.2v3.5l2.4 1.5"/><circle cx="27.5" cy="4.5" r="2.6" fill="currentColor" stroke="none"/></svg>';
+// "Resolver pendências" leva à etapa certa: cadastro (Célula/Agile Coach) → início do acompanhamento → avaliação de maturidade
+function resolverPend(id, e) {
+  const s = sqOf(id); if (!s) return;
+  if (!s.cpClasse || !s.coachId) { closeModals(); return squadForm(id); }
+  if (!s.inicio) return ACT.setInicio({ id }, e);
+  if (!s.nivel) { closeModals(); return openAval(id); }
+}
 function openSquad(id) {
   const s = sqOf(id), ns = needsOf(id), x = stats(ns), crit = DB.criterios, av = avalOf(id), ans = av ? av.respostas || {} : {}, res = classify(ans), marks = new Set(DB.marcacoes.filter(m => m.squadId === id).map(m => m.criterioId));
   const evs = [
@@ -544,17 +595,16 @@ function openSquad(id) {
   const missing = []; if (!s.cpClasse) missing.push('Célula de Produto'); if (!s.coachId) missing.push('Agile Coach'); if (!s.nivel) missing.push('nível de maturidade'); if (!s.inicio) missing.push('início do acompanhamento');
   modal(esc(sqName(s)) + ' <span class="muted small">· ' + esc(timeName(s.timeId)) + '</span>', `
   <div class="small muted" style="margin-bottom:10px">${esc(s.sistema || 'Sistema/produto não informado')}</div>
-  ${missing.length ? `<div class="note warn">Informações a complementar: ${missing.join(', ')}. <a href="#" data-act="editSquad" data-id="${id}">Complementar informações</a></div>` : ''}
-  <div class="grid two" style="margin-bottom:0"><div><h3 style="font-size:14px;margin-bottom:6px">Nível de maturidade atual</h3>
-  <div class="lvcur"><div class="lvbox" style="border-left:4px solid ${nivCol(s.nivel)}"><b>${esc(nivLabel(s.nivel))}</b><div class="small muted">${av ? 'Última avaliação: ' + fmt(av.data) : 'Ainda não avaliada'}</div></div><button class="btn" data-act="avaliar" data-id="${id}">Avaliar maturidade</button></div>
-  ${av && av.obs ? `<div class="small" style="margin-top:6px"><span class="muted">Observação da avaliação:</span> ${esc(av.obs)}</div>` : ''}
-  <div class="small muted" style="margin-top:6px">O nível é calculado pela avaliação dos critérios e não pode ser alterado manualmente. O histórico de evolução permanece preservado.</div></div>
-  <div><h3 style="font-size:14px;margin-bottom:6px">Necessidades (separado do nível)</h3><div class="bar" style="height:10px;margin-bottom:6px">${[...STATUS].map(k => { const c = ns.filter(n => stOf(n) === k).length; return c ? `<i style="width:${c / x.total * 100}%;background:${ST_COL[k]}"></i>` : ''; }).join('')}</div>
-  <div class="small">${x.total ? `<b>${x.pct}%</b> concluídas (${x.concl} de ${x.total}) · ${x.pend} pendentes (${x.pv} a validar) · ${x.and} em andamento · ${x.su} suspensas` : 'Sem necessidades registradas.'}</div>
-  <dl class="kv" style="margin-top:8px">${s.ltId && pName('lts', s.ltId) ? `<dt>Líder técnico</dt><dd>${esc(pName('lts', s.ltId))}</dd>` : ''}<dt>Célula de Produto</dt><dd>${esc(cpLabel(s.cpClasse) || '—')}</dd><dt>Agile Coach</dt><dd>${esc(pName('coaches', s.coachId) || '—')}</dd><dt>Início do acompanhamento</dt><dd>${s.inicio ? `${fmt(s.inicio)} <a href="#" class="small" data-act="setInicio" data-id="${id}">editar</a>` : `<span class="muted">Não informado</span> <a href="#" class="small" data-act="setInicio" data-id="${id}">Definir data</a>`}</dd>
-  ${s.datasPlanilha ? `<dt>Datas na planilha</dt><dd class="small">início ${fmt(s.datasPlanilha.inicio)} · previsão ${fmt(s.datasPlanilha.previsao)} <span class="muted">(a validar)</span></dd>` : ''}</dl></div></div>
+  ${missing.length ? `<div class="pendalert" role="status" title="Pendente: ${esc(missing.join(', '))}"><span class="pendic" aria-hidden="true">${IC_PEND}</span><span class="pendtx">Informações pendentes<span class="sr-only">: ${esc(missing.join(', '))}</span></span><button type="button" class="pendbtn" data-act="resolverPend" data-id="${id}">Resolver pendências</button></div>` : ''}
+  <section class="sqsec"><h3 class="sqsh">Necessidades</h3>
+  ${x.total ? `<div class="necbox"><div class="bar necbarra">${[...STATUS].map(k => { const c = ns.filter(n => stOf(n) === k).length; return c ? `<i style="width:${c / x.total * 100}%;background:${ST_COL[k]}"></i>` : ''; }).join('')}</div><div class="necsum"><b>${x.pct}%</b> concluídas (${x.concl} de ${x.total}) · ${x.pend} pendentes (${x.pv} a validar) · ${x.and} em andamento · ${x.su} suspensas</div></div>` : '<div class="small muted">Sem necessidades registradas.</div>'}
+  <dl class="kv kvgrid">${s.ltId && pName('lts', s.ltId) ? `<dt>Líder técnico</dt><dd>${esc(pName('lts', s.ltId))}</dd>` : ''}<dt>Célula de Produto</dt><dd>${esc(cpLabel(s.cpClasse) || '—')}</dd><dt>Agile Coach</dt><dd>${esc(pName('coaches', s.coachId) || '—')}</dd><dt>Início do acompanhamento</dt><dd>${s.inicio ? `${fmt(s.inicio)} <a href="#" class="small" data-act="setInicio" data-id="${id}">editar</a>` : `<span class="muted">Não informado</span> <a href="#" class="small" data-act="setInicio" data-id="${id}">Definir data</a>`}</dd>
+  ${s.datasPlanilha ? `<dt>Datas na planilha</dt><dd class="small">início ${fmt(s.datasPlanilha.inicio)} · previsão ${fmt(s.datasPlanilha.previsao)} <span class="muted">(a validar)</span></dd>` : ''}</dl></section>
+  <section class="sqsec"><h3 class="sqsh">Nível de maturidade atual</h3>
+  <div class="lvcur"><div class="lvbox" style="border-left:4px solid ${nivCol(s.nivel)}"><b>${esc(nivLabel(s.nivel))}</b><div class="small muted">${av ? 'Última avaliação: ' + fmt(av.data) + ((av.origem || []).length ? ' · origem: ' + av.origem.map(o => o === 'app' ? 'aplicação' : 'planilha').join(' + ') : '') : 'Ainda não avaliada'}</div></div><button class="btn" data-act="avaliar" data-id="${id}">Avaliar maturidade</button></div>
+  ${av && av.obs ? `<div class="small" style="margin-top:6px"><span class="muted">Observação da avaliação:</span> ${esc(av.obs)}</div>` : ''}</section>
   <h3 style="margin:16px 0 6px;font-size:14px">Critérios do modelo de maturidade</h3>
-  ${res.stages.map(st => { const cs = crit.filter(c => c.estagio === st.id), nv = niv(st.id), cons = nv && nv.fase === 'Consolidação'; return `<details class="stc"><summary><span class="stic ${cons ? 'cons' : 'trans'}" aria-hidden="true">${cons ? IC_LAYERS : IC_SWAP}</span><span class="stt"><b>${esc(nv ? nv.rotulo : st.id)}</b><em class="stchip ${cons ? 'cons' : 'trans'}">${cons ? 'consolidação' : 'evolução'}</em></span><span class="stk"><span class="kk ok">✓ ${st.sim} atendido(s)</span><span class="kk no">✕ ${st.nao} não atendido(s)</span><span class="kk pe">◷ ${st.pend} pendente(s)</span></span><span class="chev" aria-hidden="true"></span></summary><div class="small" style="padding:6px 0 6px 8px">${cs.map(c => { const a = ans[c.id]; return `<div class="crrow"><span class="crans ${a || 'pend'}">${a === 'sim' ? '✔ Sim' : a === 'nao' ? '✖ Não' : '— Não avaliado'}</span><span>${c.codigo ? '<b>' + esc(c.codigo) + '</b> ' : ''}${esc(c.texto)} <span class="muted">· ${esc(c.categoria || '')}</span></span>${marks.has(c.id) ? '<span class="muted small" title="Marcação da planilha: apenas referência">ref. planilha ☑</span>' : ''}</div>`; }).join('')}</div></details>`; }).join('')}
+  ${res.stages.map(st => { const cs = crit.filter(c => c.estagio === st.id), nv = niv(st.id), cons = nv && nv.fase === 'Consolidação'; return `<details class="stc"><summary><span class="stic ${cons ? 'cons' : 'trans'}" aria-hidden="true">${cons ? IC_LAYERS : IC_SWAP}</span><span class="stt"><b>${esc(nv ? nivLabel(st.id) : st.id)}</b><em class="stchip ${cons ? 'cons' : 'trans'}">${cons ? 'consolidação' : 'evolução'}</em></span><span class="stk"><span class="kk ok">✓ ${st.sim} atendido(s)</span><span class="kk no">✕ ${st.nao} não atendido(s)</span><span class="kk pe">◷ ${st.pend} pendente(s)</span></span><span class="chev" aria-hidden="true"></span></summary><div class="small" style="padding:6px 0 6px 8px">${cs.map(c => { const a = ans[c.id]; return `<div class="crrow"><span class="crans ${a || 'pend'}">${a === 'sim' ? '✔ Sim' : a === 'nao' ? '✖ Não' : '— Não avaliado'}</span><span>${c.codigo ? '<b>' + esc(c.codigo) + '</b> ' : ''}${esc(c.texto)} <span class="muted">· ${esc(c.categoria || '')}</span></span>${marks.has(c.id) ? '<span class="muted small" title="' + esc('Marcado com "x" na planilha de maturidade e sincronizado como atendido.' + ((DB.marcacoes.find(m => m.squadId === id && m.criterioId === c.id) || {}).obs ? ' Obs.: ' + DB.marcacoes.find(m => m.squadId === id && m.criterioId === c.id).obs : '')) + '">x na planilha</span>' : ''}</div>`; }).join('')}</div></details>`; }).join('')}
   <section class="sqhist"><h3 class="sqhh"><span class="sqhi" aria-hidden="true">${IC_CLOCK}</span>Histórico de evolução</h3>${timelineHtml(evs)}</section>`,
   `<span class="lastupd">Última atualização: ${fmt(lastUpdate(s))}</span><span class="fbtns"><button class="btn ghost" data-act="close">Fechar</button><button class="btn ghost" data-act="editSquad" data-id="${id}">Editar cadastro</button></span>`, 'sqmodal');
 }
@@ -589,7 +639,7 @@ function saveAval(id) {
   }
   let av = avalOf(id);
   if (!av) { av = { id: 'av-' + id, squadId: id }; DB.avaliacoes.push(av); }
-  av.data = data; av.respostas = ans; av.obs = obs; av.nivelResultado = res.nivel; av.salvaEm = TODAY;
+  av.data = data; av.respostas = ans; av.obs = obs; av.nivelResultado = res.nivel; av.salvaEm = TODAY; av.origem = [...new Set([...(av.origem || []), 'app'])];
   if (antes !== res.nivel) { setNivel(s, res.nivel, data, obs || 'Resultado da avaliação de maturidade.', { avaliacaoId: av.id }); s.nivel = res.nivel; }
   save(); closeModals(); render(); openSquad(id); toast(antes !== res.nivel ? 'Avaliação salva. Nível atualizado: ' + nivLabel(res.nivel) + '.' : 'Avaliação salva. O nível não mudou.');
   return true;
@@ -688,7 +738,7 @@ function render() {
   delete F.lt; // o filtro de liderança é somente Agile Coach; o líder técnico segue na base
   $('#nav').innerHTML = [...['geral', 'mat', 'needs'].map(k => [k, VIEWS[k]]), ...Object.entries(VIEWS).filter(([k]) => !['geral', 'mat', 'needs', 'cad'].includes(k))].map(([k, x]) => `<button class="${ui.view === k ? 'on' : ''}" data-act="nav" data-v="${k}" title="${x.t}" aria-label="${x.t}"><svg viewBox="0 0 24 24"><path d="${x.icon}"/></svg>${x.t}</button>`).join('');
   $('#ttl').textContent = v.t; $('#dsc').textContent = v.d; document.title = v.t + ' · Maturidade ASI';
-  $('#acts').innerHTML = ui.view === 'needs' ? '<button class="btn ghost" data-act="azImport">Importar necessidade</button>' : ui.view === 'cad' ? '<button class="btn cta" data-act="newSquad">+ Nova squad</button>' : '';
+  $('#acts').innerHTML = ui.view === 'needs' ? '<button class="btn ghost" data-act="azImport">Importar necessidade</button>' : ui.view === 'mat' ? '<button class="btn ghost" data-act="matImport">Importar planilha de maturidade</button>' : ui.view === 'cad' ? '<button class="btn cta" data-act="newSquad">+ Nova squad</button>' : '';
   const q = document.activeElement && document.activeElement.hasAttribute('data-q'), pos = q ? document.activeElement.selectionStart : 0;
   $('#view').innerHTML = { geral: () => filterBar({ geral: true }) + vGeral(), needs: vNeeds, mat: vMat, cad: vCad }[ui.view]();
   if (q) { const i = $('[data-q]'); if (i) { i.focus(); i.setSelectionRange(pos, pos); } }
@@ -831,7 +881,16 @@ function azPreview(P) {
   ${est.length || P.semEstado ? `<div class="note warn">Estado não reconhecido: ${est.map(([k, v]) => esc(k) + ' (' + v + ')').join(', ')}${P.semEstado ? (est.length ? ', ' : '') + 'sem estado (' + P.semEstado + ')' : ''}. Novos itens assim entram como Não iniciada; os já existentes mantêm o status atual.</div>` : ''}
   ${P.atualiza.length ? `<details><summary class="small">Ver itens que serão atualizados (${P.atualiza.length})</summary><ul class="small">${P.atualiza.slice(0, 40).map(o => `<li>#${esc(o.id)} ${esc(o.nome)} — <span class="muted">${esc(o.ch.join(', '))}</span></li>`).join('')}${P.atualiza.length > 40 ? '<li class="muted">… e mais ' + (P.atualiza.length - 40) + '</li>' : ''}</ul></details>` : ''}`;
 }
-function download(name, text, type) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 500); }
+function download(name, text) {
+  const box = () => copyBox(name, text);
+  try { (window.claude && window.claude.use ? window.claude.use('downloads') : Promise.resolve(null)).then(d => d ? d.save({ filename: name, data: text }).then(() => toast('Arquivo salvo.'), e => { if (!e || e.code !== 'declined') box(); }) : box(), box); } catch (e) { box(); }
+}
+function copyBox(name, text) {
+  const m = $('#modals'); m.innerHTML = '<div style="position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:90;display:flex;align-items:center;justify-content:center;padding:16px"><div role="dialog" aria-modal="true" aria-label="Exportar" style="background:#fff;border-radius:8px;padding:18px;max-width:640px;width:100%;max-height:90vh;display:flex;flex-direction:column;gap:10px"><b>' + esc(name) + '</b><textarea id="expTxt" readonly style="flex:1;min-height:240px;font:12px/1.4 monospace;border:1px solid #E0E0E0;border-radius:6px;padding:8px"></textarea><div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn ghost" id="expCopy">Copiar conteúdo</button><button class="btn" id="expClose">Fechar</button></div></div></div>';
+  const ta = $('#expTxt'); ta.value = text; ta.select();
+  $('#expClose').onclick = () => { m.innerHTML = ''; };
+  $('#expCopy').onclick = () => { ta.select(); try { navigator.clipboard.writeText(text).then(() => toast('Conteúdo copiado.'), () => toast('Selecione o texto e copie.')); } catch (e) { toast('Selecione o texto e copie.'); } };
+}
 const ACT = {
   nav: d => { ui.view = d.v; render(); }, advToggle: () => { ui.adv = !ui.adv; render(); }, toggleZero: () => { ui.showZero = !ui.showZero; render(); }, close: () => { const m = $$('.overlay'); m.length && m[m.length - 1].remove(); }, clearF: () => { F = {}; render(); }, toggleTime: d => { const cur = d.open === '1'; ui.open[d.id] = !cur; render(); }, expAll: d => { ['cp:CP I', 'cp:CP II', 'cp:CP III', 'cp:Sem CP', 'cp:A Classificar'].forEach(k => { ui.open[k] = d.v === '1'; }); render(); },
   nv: d => { ui.nv = d.v; render(); }, sort: d => { ui.sort = { k: d.k, d: ui.sort.k === d.k ? -ui.sort.d : 1 }; render(); },
@@ -847,14 +906,14 @@ const ACT = {
   openSq: d => openSquad(d.id), avaliar: d => { closeModals(); openAval(d.id); }, saveAval: d => saveAval(d.id), cancelAval: d => { closeModals(); openSquad(d.id); },
   editSquad: d => { closeModals(); squadForm(d.id); }, newSquad: () => { closeModals(); squadForm(); }, saveSquad: d => saveSquad(d.id),
   cadTab: d => { ui.cad = d.k; render(); }, quick: d => { ui.per = { a: d.a, b: d.b }; render(); },
-  editTime: d => { const t = G(DB.times, d.id), nome = prompt('Nome do time ' + t.codigo + ':', t.nome || ''); if (nome !== null) { t.nome = nome.trim() || null; save(); render(); } },
+  editTime: d => { const t = G(DB.times, d.id), nome = null; void t; },
   addPerson: d => personForm(d.l), editPerson: d => personForm(d.l, d.id),
   savePerson: d => { const fd = Object.fromEntries(new FormData($('#pf'))); if (!fd.nome.trim()) { $('#pferr').textContent = 'Informe o nome.'; return; } let p = d.id ? G(DB[d.l], d.id) : null; if (!p) { p = { id: uid(d.l), nome: '' }; DB[d.l].push(p); } p.nome = fd.nome.trim(); p.matricula = fd.matricula.trim() || null; delete p.nomeIncompleto; save(); closeModals(); render(); },
   azImport: () => azImport(),
   azGo: () => { if (!azPlan) return; const r = azApply(azPlan); azPlan = null; closeModals(); render(); toast('Importação concluída: ' + r.nN + ' nova(s), ' + r.nU + ' atualizada(s).'); },
   expJson: () => download('maturidade-asi-' + TODAY + '.json', JSON.stringify(DB, null, 1), 'application/json'),
   expCsv: () => download('necessidades-' + TODAY + '.csv', csv([['Squad', 'Time', 'Necessidade', 'Nível', 'Líder técnico', 'Célula de Produto', 'Agile Coach', 'Início', 'Prevista', 'Conclusão', 'Status', 'Data na planilha', 'Observações'], ...DB.needs.map(n => { const s = sqOf(n.squadId); return [sqName(s), timeName(s.timeId), n.nome, nivLabel(n.nivel), pName('lts', eff(n, 'ltId')), cpLabel(s.cpClasse), pName('coaches', eff(n, 'coachId')), n.dataInicio, n.dataPrevista, n.dataConclusao, n.status || PV, n.dataPlanilha, n.obs]; })]), 'text/csv'),
-  reset: () => { if (SYNC.on) return toast('Indisponível com o banco compartilhado: restaurar apagaria os dados de todos.'); if (confirm('Descartar todas as alterações e restaurar os dados importados da planilha e do print?')) { DB = clone(window.SEED); save(); F = {}; render(); toast('Dados originais restaurados.'); } },
+  reset: () => { if (SYNC.on) return toast('Indisponível com o banco compartilhado: restaurar apagaria os dados de todos.'); if (twice('reset', 'Clique de novo para descartar todas as alterações e restaurar os dados originais.')) { DB = clone(window.SEED); save(); F = {}; render(); toast('Dados originais restaurados.'); } },
 };
 document.addEventListener('click', e => {
   const t = e.target.closest('[data-act]'); if (!t || !ACT[t.dataset.act]) return;
@@ -868,7 +927,7 @@ document.addEventListener('change', e => {
   else if (t.dataset.per) { ui.per[t.dataset.per] = t.value; render(); }
   else if (t.dataset.cmp) { ui.cmp = t.checked ? [...ui.cmp, t.dataset.cmp] : ui.cmp.filter(x => x !== t.dataset.cmp); render(); }
   else if (t.dataset.azf !== undefined && t.files[0]) { const bx = $('#azprev'); bx.innerHTML = '<div class="muted small">Lendo arquivo…</div>'; azReadFile(t.files[0]).then(rows => azPreview(azBuild(rows))).catch(() => { bx.innerHTML = '<div class="note warn">Não foi possível ler o arquivo. Use CSV ou Excel (.xlsx) exportado do Azure DevOps.</div>'; }); }
-  else if (t.dataset.imp !== undefined && t.files[0]) { t.files[0].text().then(tx => { try { const d = JSON.parse(tx); if (!d.squads || !d.needs) throw 0; if (!confirm('Substituir todos os dados atuais pelo arquivo importado?')) return; DB = d; if (!DB.avaliacoes) DB.avaliacoes = []; normalizarNecessidades(); save(); render(); toast('Dados importados.'); } catch (x) { toast('Arquivo inválido.'); } }); }
+  else if (t.dataset.imp !== undefined && t.files[0]) { t.files[0].text().then(tx => { try { const d = JSON.parse(tx); if (!d.squads || !d.needs) throw 0;  DB = d; if (!DB.avaliacoes) DB.avaliacoes = []; normalizarNecessidades(); save(); render(); toast('Dados importados.'); } catch (x) { toast('Arquivo inválido.'); } }); }
 });
 document.addEventListener('input', e => { if (e.target.hasAttribute('data-q')) { ui.q = e.target.value; render(); } });
 document.addEventListener('dragstart', e => { const k = e.target.closest && e.target.closest('.kcard'); if (k) e.dataTransfer.setData('text/plain', k.dataset.id); });
@@ -993,7 +1052,7 @@ async function startSync() {
   authBusy('Sincronizando com o banco…');
   const rem = await pullAll();
   SYNC.on = true;
-  if (rem.squads.length || rem.needs.length) { adopt(rem); toast('Dados carregados do banco.'); }
+  if (rem.squads.length || rem.needs.length) { adopt(rem); if (syncPlanilha()) save(); toast('Dados carregados do banco.'); }
   else if (!DB.squads.length) { SYNC.snap = snapFrom(DB); toast('Banco vazio: use "Importar backup" no menu lateral para carregar os dados.'); }
   else { SYNC.snap = {}; await pushDiff(); SYNC.last = new Date(); SYNC.state = 'ok'; toast('Banco vazio: dados locais migrados (' + DB.squads.length + ' squads, ' + DB.needs.length + ' necessidades).'); }
   SYNC.state = 'ok'; if (!SYNC.last) SYNC.last = new Date();
@@ -1090,7 +1149,7 @@ async function importGo() {
   if (!d || !Array.isArray(d.squads) || !Array.isArray(d.needs)) { $('#imperr').textContent = 'Conteúdo inválido: use o arquivo gerado em "Exportar backup".'; return; }
   for (const k of Object.keys(TBL)) if (!Array.isArray(d[k])) d[k] = [];
   d.migr = d.migr || {}; d.importacao = d.importacao || { avisos: [] };
-  DB = d; normalizarNecessidades(); if (SYNC.on) ordenar(DB); save(); closeModals(); render();
+  DB = d; normalizarNecessidades(); syncPlanilha(); if (SYNC.on) ordenar(DB); save(); closeModals(); render();
   if (SYNC.on) { toast('Enviando ao banco…'); await flush(); toast(SYNC.state === 'ok' ? 'Backup importado: ' + DB.squads.length + ' squads, ' + DB.needs.length + ' necessidades.' : 'Importação salva aqui, mas o envio ao banco falhou: ' + SYNC.err); }
   else toast('Backup importado: ' + DB.squads.length + ' squads, ' + DB.needs.length + ' necessidades.');
 }
@@ -1106,9 +1165,92 @@ Object.assign(ACT, {
     saveSes(null); SYNC.on = false; SYNC.snap = {}; try { localStorage.removeItem(KEY + '-cloud'); } catch (e) { }
     load(); renderAcct(); render(); authShow('');
   },
-  sbPull: async () => { toast('Atualizando…'); try { await flush(); adopt(await pullAll()); render(); renderAcct(); toast('Dados atualizados do banco.'); } catch (e) { toast('Não foi possível atualizar: ' + errPt(e)); } },
+  sbPull: async () => { toast('Atualizando…'); try { await flush(); adopt(await pullAll()); if (syncPlanilha()) save(); render(); renderAcct(); toast('Dados atualizados do banco.'); } catch (e) { toast('Não foi possível atualizar: ' + errPt(e)); } },
   sbMigrar: () => migrarModal(),
   sbMig: d => migrar(d.m),
+});
+
+// ---- importação da planilha de maturidade (Ações de Melhoria: práticas nas linhas, squads nas colunas, "x" = atendido) ----
+let matPlan = null;
+const matN = v => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+function matCritIndex() {
+  const byTxt = new Map(DB.criterios.map(c => [matN((c.codigo ? c.codigo + ' ' : '') + c.texto).toLowerCase(), c])), byCode = new Map(DB.criterios.filter(c => c.codigo).map(c => [c.codigo, c]));
+  return t => { t = matN(t); if (!t) return null; return byTxt.get(t.toLowerCase()) || byCode.get((/^([A-Z]{2} \d+\.\d+)\b/.exec(t) || [])[1]) || null; };
+}
+function matSquad(h) {
+  const cod = (/(\d{3})/.exec(h) || [])[1]; if (!cod) return null;
+  const l = DB.squads.filter(s => s.codigo === cod); if (l.length <= 1) return l[0] || null;
+  const tm = (/time\s*(\d{1,3})/i.exec(h) || [])[1];
+  return (tm && l.find(s => (G(DB.times, s.timeId) || {}).codigo === tm.padStart(3, '0'))) || l[0];
+}
+function matParse(rows, arquivo) {
+  const crit = matCritIndex();
+  const hi = rows.findIndex(r => (r || []).some(v => /n[ií]veis de maturidade organizacional|valores culturais/i.test(matN(v))));
+  if (hi < 0) return { erro: 'Não encontrei o cabeçalho da matriz (linha com "Níveis de Maturidade Organizacional" / "Valores Culturais").' };
+  const body = rows.slice(hi + 1), W = Math.max(0, ...rows.map(r => (r || []).length));
+  let pc = -1, best = 0;                                   // coluna das práticas: a que mais corresponde aos critérios cadastrados
+  for (let c = 0; c < W; c++) { let n = 0; for (const r of body) if (crit((r || [])[c])) n++; if (n > best) { best = n; pc = c; } }
+  if (pc < 0) return { erro: 'Nenhuma prática da planilha corresponde aos critérios cadastrados no app.' };
+  const head = rows[hi] || [], cols = [];
+  for (let c = pc + 1; c < W; c++) { const h = matN(head[c]); if (!h || /^obs/i.test(h)) continue; cols.push({ c, nome: h, obs: /^obs/i.test(matN(head[c + 1])) ? c + 1 : -1, sq: matSquad(h) }); }
+  const linhas = [], semMatch = [], vistos = new Set();
+  body.forEach((r, k) => { const txt = matN((r || [])[pc]); if (!txt) return; const cr = crit(txt); if (!cr) { semMatch.push({ linha: hi + 2 + k, txt }); return; } if (vistos.has(cr.id)) return; vistos.add(cr.id); linhas.push({ r: r || [], cr }); });
+  const porSquad = new Map();
+  for (const col of cols) {
+    if (!col.sq) continue;
+    const g = porSquad.get(col.sq.id) || { s: col.sq, colunas: [], xs: new Set(), obs: {} }; g.colunas.push(col.nome);
+    for (const l of linhas) { if (/^x$/i.test(matN(l.r[col.c]))) g.xs.add(l.cr.id); const o = col.obs >= 0 ? matN(l.r[col.obs]) : ''; if (o) g.obs[l.cr.id] = (g.obs[l.cr.id] ? g.obs[l.cr.id] + ' | ' : '') + o; }
+    porSquad.set(col.sq.id, g);
+  }
+  for (const g of porSquad.values()) {
+    const av = avalOf(g.s.id), ans = av ? av.respostas || {} : {}, prev = Object.assign({}, ans); g.xs.forEach(c => { prev[c] = 'sim'; });
+    g.novosSim = [...g.xs].filter(c => ans[c] !== 'sim').length; g.naoParaSim = [...g.xs].filter(c => ans[c] === 'nao').length;
+    g.nivelAntes = g.s.nivel || null; g.nivelDepois = g.xs.size ? classify(prev).nivel : g.nivelAntes;
+  }
+  return { arquivo, praticas: linhas.length, semMatch, cols, porSquad, semSquad: cols.filter(c => !c.sq).map(c => c.nome) };
+}
+function matReadFile(file) {
+  return azLoadXlsx().then(() => file.arrayBuffer()).then(buf => {
+    const wb = XLSX.read(buf, { type: 'array' });
+    const all = wb.SheetNames.map(n => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false, defval: '' }));
+    return all.find(rows => rows.some(r => r.some(v => /n[ií]veis de maturidade organizacional/i.test(matN(v))))) || all[0] || [];
+  });
+}
+function matImport() {
+  matPlan = null;
+  modal('Importar planilha de maturidade', `<div class="note">Selecione a planilha de <b>Ações de Melhoria</b> (aba com a matriz <i>Níveis de Maturidade Organizacional</i>). Cada <b>"x"</b> vira <b>Sim</b> na avaliação da squad; células vazias não alteram nada. As práticas são casadas pelo código/texto dos critérios e as colunas pelo código da squad. Nada é gravado antes de você confirmar.</div>
+  <label class="btn ghost" style="cursor:pointer;display:inline-block;margin:10px 0">Selecionar planilha (.xlsx)<input type="file" accept=".xlsx,.xls,.csv" data-matf hidden></label><div id="matprev"></div>`,
+  '<button class="btn ghost" data-act="close">Cancelar</button><button class="btn" data-act="matGo" id="matgo" disabled>Aplicar e sincronizar</button>', 'narrow');
+}
+function matPreview(P) {
+  const box = $('#matprev'), go = $('#matgo'); matPlan = null;
+  if (P.erro) { box.innerHTML = '<div class="note warn">' + esc(P.erro) + '</div>'; go.disabled = true; return; }
+  const gs = [...P.porSquad.values()], comX = gs.filter(g => g.xs.size);
+  box.innerHTML = `<div class="small" style="margin-bottom:6px"><b>${P.praticas}</b> prática(s) reconhecida(s) · <b>${P.cols.length}</b> coluna(s) de squad · <b>${comX.length}</b> squad(s) com "x"</div>
+  <table class="mig"><thead><tr><th>Squad</th><th>"x"</th><th>Viram Sim</th><th>Nível atual → após</th></tr></thead><tbody>${gs.map(g => `<tr><td>${esc(sqName(g.s))}<div class="muted small">${esc(g.colunas.join(', '))}</div></td><td class="num">${g.xs.size}</td><td class="num">${g.novosSim}${g.naoParaSim ? '<div class="small late">' + g.naoParaSim + ' hoje "Não"</div>' : ''}</td><td>${g.xs.size ? esc(nivShort(g.nivelAntes)) + ' → <b>' + esc(nivShort(g.nivelDepois)) + '</b>' : '<span class="muted small">sem marcações: nada muda</span>'}</td></tr>`).join('')}</tbody></table>
+  ${P.semSquad.length ? '<div class="note warn small" style="margin-top:8px">Colunas sem squad correspondente (ignoradas): ' + esc(P.semSquad.join(', ')) + '</div>' : ''}
+  ${P.semMatch.length ? '<div class="note warn small" style="margin-top:8px">Linhas sem critério correspondente (ignoradas): ' + P.semMatch.slice(0, 6).map(x => 'linha ' + x.linha + ': ' + esc(x.txt.slice(0, 50))).join('; ') + (P.semMatch.length > 6 ? '…' : '') + '</div>' : ''}`;
+  go.disabled = !comX.length; if (comX.length) matPlan = P;
+}
+function matApply(P) {
+  const ids = []; let novas = 0;
+  for (const [sid, g] of P.porSquad) {
+    if (!g.xs.size) continue; ids.push(sid);
+    for (const cid of g.xs) {
+      let m = DB.marcacoes.find(x => x.squadId === sid && x.criterioId === cid);
+      if (!m) { m = { squadId: sid, criterioId: cid }; DB.marcacoes.push(m); novas++; }
+      m.aplicadaEm = null; m.origem = P.arquivo; m.importadaEm = TODAY; if (g.obs[cid]) m.obs = g.obs[cid];   // reaplicar: a planilha é a informação mais recente
+    }
+  }
+  syncPlanilha(ids, P.arquivo);
+  DB.importacao = DB.importacao || { avisos: [] }; DB.importacao.maturidade = { data: TODAY, arquivo: P.arquivo, squads: ids.length };
+  save(); return { squads: ids.length, novas };
+}
+document.addEventListener('change', e => { const f = e.target; if (f.dataset && f.dataset.matf !== undefined && f.files[0]) { const bx = $('#matprev'); bx.innerHTML = '<div class="muted small">Lendo planilha…</div>'; const nome = f.files[0].name; matReadFile(f.files[0]).then(rows => matPreview(matParse(rows, nome))).catch(() => { bx.innerHTML = '<div class="note warn">Não foi possível ler o arquivo. Use a planilha .xlsx de Ações de Melhoria.</div>'; }); } });
+Object.assign(ACT, {
+  matImport: () => matImport(),
+  resolverPend: (d, e) => resolverPend(d.id, e),
+  matGo: () => { if (!matPlan) return; const r = matApply(matPlan); matPlan = null; closeModals(); render(); toast('Planilha aplicada: ' + r.squads + ' squad(s) sincronizada(s)' + (r.novas ? ', ' + r.novas + ' nova(s) marcação(ões)' : '') + '.'); },
 });
 
 load(); render(); gate();
